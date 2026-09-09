@@ -106,7 +106,7 @@ enum {
 static int g_wheelPolarity = 0; // 0 = ещё не определена в этой сессии
 
 const int tailMs = 5;
-const float g_avgSpeedPercent = 0.75;
+const float g_avgSpeedSpanMs = 3.0;// ms
 // ------------------------------------------------------------- globals ------
 struct DevInfo { GUID guid; std::wstring name; };
 
@@ -146,12 +146,16 @@ struct GraphData {
     std::vector<GraphPt> raw_pts;
     float pulseMs;   // длительность импульса
     float latMs;     // измеренная задержка, -1 если не определена
+    float avgLatMs_total;
     float thrDeg;    // порог срабатывания, градусы
     float ltDeg;     // <-- порог линейной зоны symlog, считается один раз при добавлении
     int   idx;       // номер импульса (1..N)
     float forcePct;  // сила, % (для подписи)
     float acc;       // ускорение на интервале порога срабатывания до длины импульса
-    float avgV;      // средняя скорость на интервале порога срабатывания до длины импульса   
+    float avgV;      // средняя скорость на интервале порога срабатывания до длины импульса  
+    float acc_avg_total;// среднее ускорение за все измерения
+    float avgV_total;// средняя скорость за все измерения
+    float avgDeg_total;// средний угол в конце импульса
     float noise;     // уровень шума в градусах
 };
 
@@ -161,6 +165,9 @@ static bool  g_hasMouse = false;
 static int g_mouseX = 0;
 static int   g_snapIdx = -1;   // индекс в raw_pts текущего графика, к которому примагничен крест
 static HWND g_hGraph = nullptr, g_hGraphLbl = nullptr, g_hCopyright = nullptr;
+
+int okCount = 0;
+
 // «Красивый» шаг сетки: 1/2/5 * 10^k
 static double NiceStep(double range, int targetDivs)
 {
@@ -388,14 +395,7 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
     HPEN penPulse = CreatePen(PS_DOT, 1, RGB(110, 110, 190));
     SelectObject(dc, penPulse);
     MoveToEx(dc, X(gd->pulseMs), pl.top, nullptr); LineTo(dc, X(gd->pulseMs), pl.bottom);
-    
-    {
-        SelectObject(dc, font2);
 
-        SetTextColor(dc, RGB(110, 110, 190));
-        swprintf(buf, 64, L"%.0f мс", gd->pulseMs);
-        TextOutW(dc, X(gd->pulseMs) + 4, pl.top + 2, buf, (int)wcslen(buf));
-    }
 
     // Маркер задержки (вертикаль, красный)
     if (gd->latMs >= 0)
@@ -497,7 +497,9 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         float midValue = 0;
         float valuePercent = 0;
         float impulseMid = gd->latMs + (gd->pulseMs - gd->latMs) * 0.5;
-        float impulsePercent = gd->latMs + (gd->pulseMs - gd->latMs) * g_avgSpeedPercent;
+        float impulsePercent = gd->pulseMs - g_avgSpeedSpanMs*0.5;
+        float impulseSpanStartMS = gd->pulseMs - g_avgSpeedSpanMs * 0.5;
+        float impulseSpanEndMS = gd->pulseMs + g_avgSpeedSpanMs * 0.5;
         float impulsePercentRawMS = 0;
 
         for (const auto& p : gd->pts)
@@ -523,25 +525,90 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         int endY = Y(impulseEndValue);
         int percX = X(impulsePercent);
         int percY = Y(valuePercent);
+        int midY = Y(midValue);
+        int endSpanX = X(gd->pulseMs + g_avgSpeedSpanMs * 0.5);
+
+        // Конец импульса (текст)
+        {
+            SetTextColor(dc, RGB(110, 110, 190));
+            swprintf(buf, 64, L"%.0f мс", gd->pulseMs);
+            TextOutW(dc, X(gd->pulseMs) + 10, midY - 15, buf, (int)wcslen(buf));
+        }
 
         SetTextColor(dc, RGB(255, 255, 255));
         swprintf(buf, 64, L"%.0f об/м/с", gd->acc);
         TextOutW(dc, X(impulseMid) + 5, Y(midValue) + 5, buf, (int)wcslen(buf));
 
-        swprintf(buf, 64, L"%.0f об/м", gd->avgV);
-        TextOutW(dc, percX + 5, endY - 25, buf, (int)wcslen(buf));
+        {
+            swprintf(buf, 64, L"%.0f об/м", gd->avgV);
+
+            SIZE sz;
+            GetTextExtentPoint32W(dc, buf, (int)wcslen(buf), &sz);
+
+            TextOutW(dc, percX + (endSpanX - percX - sz.cx)*0.5, percY + 10, buf, (int)wcslen(buf));
+        }
+
+       
+
+        {
+            int top = pl.bottom - 160;
+
+            
+            RECT bgr = { pl.right - 280, top - 10, pl.right + 1, pl.bottom + 1 };
+            HBRUSH brBg = CreateSolidBrush(RGB(24, 24, 28));
+            FillRect(dc, &bgr, brBg);
+            DeleteObject(brBg);
+
+            HBRUSH brFr = CreateSolidBrush(RGB(48, 48, 56));
+            FrameRect(dc, &bgr, brFr);
+            DeleteObject(brFr);
+            
+
+            SetTextColor(dc, RGB(255, 255, 255));
+
+            swprintf(buf, 64, L"Измерений: %d", okCount);
+            TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
+
+            swprintf(buf, 64, L"Ср. угол: %.2f\u00B0", gd->avgDeg_total);
+            TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
+
+            swprintf(buf, 64, L"Ср. скорость: %.1f об/м", gd->avgV_total);
+            TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
+
+            swprintf(buf, 64, L"Ср. ускорение: %.0f об/м/с", gd->acc_avg_total);
+            TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
+
+
+            swprintf(buf, 64, L"Ср. задержка: %.2f мс", gd->avgLatMs_total);
+            TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
+        }
+
+       
 
         DeleteObject(penLat);
 
 
         SetTextColor(dc, RGB(80, 200, 120));
 
-        SelectObject(dc, font);
+      
         //swprintf(buf, 64, L"%.2f\u00B0", valuePercent);
         //TextOutW(dc, percX - 65, percY - 15, buf, (int)wcslen(buf));
+        SelectObject(dc, font);
 
-        swprintf(buf, 64, L"%.0f%%", g_avgSpeedPercent*100.0);
-        TextOutW(dc, percX + 5, pl.top, buf, (int)wcslen(buf));
+        {
+            swprintf(buf, 64, L"%.1f мс", impulseSpanStartMS);
+
+            SIZE sz;
+            GetTextExtentPoint32W(dc, buf, (int)wcslen(buf), &sz);
+
+            TextOutW(dc, percX - 5 - sz.cx, pl.top, buf, (int)wcslen(buf));
+        }
+
+        {
+            swprintf(buf, 64, L"%.1f мс", impulseSpanEndMS);
+
+            TextOutW(dc, endSpanX + 5, pl.top, buf, (int)wcslen(buf));
+        }
 
         swprintf(buf, 64, L"%.2f\u00B0", impulseEndValue);
         TextOutW(dc, pl.right - 50 + 5, endY - 7, buf, (int)wcslen(buf));
@@ -558,13 +625,17 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
             SelectObject(dc, penThr);
 
             MoveToEx(dc, percX, percY, nullptr); LineTo(dc, percX, pl.top);
+
+            
+            MoveToEx(dc, endSpanX, percY, nullptr); LineTo(dc, endSpanX, pl.top);
+
             DeleteObject(penThr);
         }
 
         // Горизонтальная пунктирная - замер ускорения
         HPEN penThr = CreatePen(PS_DOT, 1, RGB(230, 80, 80));
         SelectObject(dc, penThr);
-        MoveToEx(dc, startX, Y(midValue), nullptr); LineTo(dc, endX, Y(midValue));
+        MoveToEx(dc, startX, midY, nullptr); LineTo(dc, endX, midY);
         DeleteObject(penThr);
         
     }
@@ -1034,7 +1105,7 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
 
         std::vector<Sample> smp; smp.reserve(8192);
         double sumLat = 0, sumAngle = 0, sumAccAv = 0, sumVel = 0, sumThrDeg = 0;
-        int okCount = 0;
+        okCount = 0;
 
         PostMessage(hN, WM_APP_CLEARGRAPH, 0, 0);
 
@@ -1135,26 +1206,29 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
             double avgV = 0, t_pulse = -1;
             double percentX = 0;
             double t_percent = 0;
-            double midDeg = 0;
             double pulseX = 0;
             double lastDeg = 0;
             for (int k = 2; k < n - 2; ++k) {
                 if (smp[k].t < lat) continue;// Не считаем скорости до порога
 
-                if (smp[k].t > P.pulseMs) break;
+                if (smp[k].t > P.pulseMs + g_avgSpeedSpanMs * 0.5) break;
 
-                if (smp[k].t <= lat + (P.pulseMs - lat) * g_avgSpeedPercent)
+                //if (smp[k].t <= lat + (P.pulseMs - lat) * g_avgSpeedPercent)
+                if (smp[k].t <= P.pulseMs - g_avgSpeedSpanMs * 0.5)
                 {
                     percentX = xs[k];// берем значение угла со сглаженного графика
                     t_percent = smp[k].t;
                 }
 
                 t_pulse = smp[k].t;
-                pulseX = xs[k];// fabs(smp[k].x - x0);
-            }
-            lastDeg = pulseX / unitsPerDeg;
-            midDeg = percentX / unitsPerDeg;
+                pulseX = xs[k];
 
+                if (smp[k].t <= P.pulseMs)
+                {
+                    lastDeg = pulseX / unitsPerDeg;
+                }
+            }
+            
             // среднее ускорение разгона: от начала движения до пика скорости
             double aavg = 0;
 
@@ -1197,12 +1271,22 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
             PostText(hN, WM_APP_ADDTSV, tsv);
 
             {
+                double mAav = sumAccAv / okCount, mVel = sumVel / okCount;
+                double mLat = sumLat / okCount;
+                double mAngle = sumAngle / okCount;
+
                 GraphData* gd = new GraphData;
                 gd->noise = noise / unitsPerDeg;// град
                 gd->acc = aavgRPMs;// об/мин/с
+                gd->acc_avg_total = mAav / 6.0;// об/мин/с
                 gd->avgV = avgV * 1000.0 / unitsPerDeg / 6.0;// об/мин
+                gd->avgV_total = mVel / 6.0;// об/мин
+                gd->avgDeg_total = mAngle;// град
                 gd->pulseMs = (float)P.pulseMs;
                 gd->latMs = (float)lat;
+                gd->avgLatMs_total = mLat;
+                
+
                 gd->thrDeg = (float)(thr / unitsPerDeg);      // твой коэффициент raw -> градусы
                 gd->idx = i + 1;
                 gd->forcePct = (float)P.forcePct;
@@ -1360,7 +1444,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         int x = 10;
         MkLabel(hWnd, L"Импульс, мс:", x, y, 80); x += 85; MkEdit(hWnd, IDC_EDIT_PULSE, L"20", x, y, 50); x += 65;
         MkLabel(hWnd, L"Сила, %:",     x, y, 50);  x += 55; MkEdit(hWnd, IDC_EDIT_FORCE,   L"100", x, y, 50); x += 65;
-        MkLabel(hWnd, L"Повторы:",     x, y, 60); x += 65; MkEdit(hWnd, IDC_EDIT_REPEATS, L"6", x, y, 50); x += 65;
+        MkLabel(hWnd, L"Повторы:",     x, y, 60); x += 65; MkEdit(hWnd, IDC_EDIT_REPEATS, L"10", x, y, 50); x += 65;
         //MkLabel(hWnd, L"Пауза, мс:",     x, y, 70);  x += 70; MkEdit(hWnd, IDC_EDIT_PAUSE,   L"500", x, y, 50); x += 65;
         MkLabel(hWnd, L"Руль, град:",    x,  y, 70); x += 75; MkEdit(hWnd, IDC_EDIT_WHEELDEG, L"900", x, y, 50); x += 65;
         MkLabel(hWnd, L"Порог, град:",   x, y, 80);  x += 85; MkEdit(hWnd, IDC_EDIT_THRESH,   L"0.01", x, y, 50); x += 65;
@@ -1458,6 +1542,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         GraphData* gd = (GraphData*)lp;
         gd->ltDeg = (float)ComputeLinThreshold(gd);
         g_graphs.push_back(gd);
+
+        for (auto& g : g_graphs)
+        {
+            g->acc_avg_total = gd->acc_avg_total;
+            g->avgV_total = gd->avgV_total;
+        }
         // автопереход на только что добавленный график
         SetCurGraph((int)g_graphs.size() - 1);
         return 0;
@@ -1568,7 +1658,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     RegisterClassW(&wc);
     
     HWND hWnd = CreateWindowW(L"FFBMeterWnd",
-        L"FFB Meter - 0.1.5",
+        L"FFB Meter - 0.2.1",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1500, 900,
         nullptr, nullptr, hInst, nullptr);
