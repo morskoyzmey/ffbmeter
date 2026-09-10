@@ -31,7 +31,7 @@
 //    * Задержка срабатывания — после вызова Start() до первого движения 
 //     (THREAD_PRIORITY_TIME_CRITICAL, busy-wait,  t0 = конец вызова Start, 
 //      подтверждение движения относительно шумовой полки)
-//    * Средняя скорость (75%-100%) — (pulseX - percentX)/(t_pulse - t_percent), град/с и об/мин
+//    * Средняя скорость в промежутке +/- 1.5 мс от времени импульса, град/с и об/мин
 //    * Среднее ускорение           — avgV/(t_vmax - t_start), град/с² и об/мин/с
 //    * Амплитуда                   — град
 //  После каждого импульса руль возвращается в центр P-D регулятором
@@ -104,6 +104,7 @@ enum {
 #define WM_APP_ADDTSV  (WM_APP + 4)   // lParam = wchar_t* (heap) — строка в TSV-буфер
 
 static int g_wheelPolarity = 0; // 0 = ещё не определена в этой сессии
+static int g_Repeats = 10;
 
 const int tailMs = 5;
 const float g_avgSpeedSpanMs = 3.0;// ms
@@ -141,21 +142,23 @@ struct MeasureParams {
 
 struct GraphPt { float t; float deg; };   // t, мс от Start(); угол, градусы (отн. базовой линии)
 
+float avgDeg_total;// средний угол в конце импульса
+float acc_avg_total;// среднее ускорение за все измерения
+float avgV_total;// средняя скорость за все измерения
+float avgLatMs_total;// средняя задержка за все измерения
+float avg_thrDeg_total;// средний порог срабатывания
+
 struct GraphData {
     std::vector<GraphPt> pts;
     std::vector<GraphPt> raw_pts;
     float pulseMs;   // длительность импульса
     float latMs;     // измеренная задержка, -1 если не определена
-    float avgLatMs_total;
     float thrDeg;    // порог срабатывания, градусы
     float ltDeg;     // <-- порог линейной зоны symlog, считается один раз при добавлении
     int   idx;       // номер импульса (1..N)
     float forcePct;  // сила, % (для подписи)
     float acc;       // ускорение на интервале порога срабатывания до длины импульса
     float avgV;      // средняя скорость на интервале порога срабатывания до длины импульса  
-    float acc_avg_total;// среднее ускорение за все измерения
-    float avgV_total;// средняя скорость за все измерения
-    float avgDeg_total;// средний угол в конце импульса
     float noise;     // уровень шума в градусах
 };
 
@@ -266,7 +269,7 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
     HFONT oldFont = (HFONT)SelectObject(dc, font);
     SetBkMode(dc, TRANSPARENT);
 
-    if (!gd || gd->pts.empty()) {
+    if ((!gd || gd->pts.empty()) && g_graphs.empty()) {
         SetTextColor(dc, RGB(140, 140, 140));
         RECT r = rc;
         DrawTextW(dc, L"Нет данных — запустите измерение", -1, &r,
@@ -274,6 +277,10 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         SelectObject(dc, oldFont); DeleteObject(font);
         return;
     }
+
+    bool bShowAll = gd == nullptr;
+
+    if (!gd) gd = g_graphs[0];// для базовых построений - первое валидное измерение подойдет
 
     // Область построения
     GraphGeom geom = ComputeGraphGeom(rc, gd);
@@ -366,6 +373,7 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
 
 
     // Уровень шума
+    if(!bShowAll)
     {
         HPEN penThr = CreatePen(PS_DOT, 1, RGB(230, 80, 80));
         SelectObject(dc, penThr);
@@ -379,6 +387,7 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
     }
 
     // Порог thr (пунктир, только положительная сторона)
+    if (!bShowAll)
     {
         HPEN penThr = CreatePen(PS_DOT, 1, RGB(255, 170, 60));
         SelectObject(dc, penThr);
@@ -389,7 +398,29 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         SetTextColor(dc, RGB(255, 170, 60));
         swprintf(buf, 64, L"Порог: %.3f\u00B0", gd->thrDeg);
         TextOutW(dc, pl.left + 4, Y(gd->thrDeg) - 20, buf, (int)wcslen(buf));
-    }        
+    } 
+    else
+    {
+        HPEN penThr = CreatePen(PS_DOT, 1, RGB(255, 170, 60));
+        SelectObject(dc, penThr);
+
+        for (auto gdi : g_graphs)
+        {
+            MoveToEx(dc, pl.left, Y(gdi->thrDeg), nullptr); LineTo(dc, X(gdi->latMs), Y(gdi->thrDeg));
+        }
+
+        DeleteObject(penThr);
+
+        SelectObject(dc, font2);
+        swprintf(buf, 64, L"Порог: %.3f\u00B0", avg_thrDeg_total);
+
+        SetTextColor(dc, RGB(0, 0, 0));
+        TextOutW(dc, pl.left + 5, Y(avg_thrDeg_total) - 21, buf, (int)wcslen(buf));
+        TextOutW(dc, pl.left + 3, Y(avg_thrDeg_total) - 19, buf, (int)wcslen(buf));
+
+        SetTextColor(dc, RGB(255, 170, 60));
+        TextOutW(dc, pl.left + 4, Y(avg_thrDeg_total) - 20, buf, (int)wcslen(buf));
+    }
 
     // Конец импульса (вертикаль)
     HPEN penPulse = CreatePen(PS_DOT, 1, RGB(110, 110, 190));
@@ -398,21 +429,51 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
 
 
     // Маркер задержки (вертикаль, красный)
-    if (gd->latMs >= 0)
+    if (!bShowAll)
+    {
+        if (gd->latMs >= 0)
+        {
+            SelectObject(dc, font2);
+
+            HPEN penLat = CreatePen(PS_DOT, 1, RGB(230, 80, 80));
+            SelectObject(dc, penLat);
+            int x = X(gd->latMs);
+            MoveToEx(dc, x, pl.top, nullptr); LineTo(dc, x, pl.bottom);
+            DeleteObject(penLat);
+
+            swprintf(buf, 64, L"%.2f мс", gd->latMs);
+            SetTextColor(dc, RGB(230, 80, 80));
+            TextOutW(dc, x + 4, pl.top + 2, buf, (int)wcslen(buf));
+        }
+    }
+    else
     {
         SelectObject(dc, font2);
-
-        HPEN penLat = CreatePen(PS_SOLID, 1, RGB(230, 80, 80));
+        HPEN penLat = CreatePen(PS_DOT, 1, RGB(230, 80, 80));
         SelectObject(dc, penLat);
-        int x = X(gd->latMs);
-        MoveToEx(dc, x, pl.top, nullptr); LineTo(dc, x, pl.bottom);
+
+        for (auto gdi : g_graphs)
+        {
+            if (gdi->latMs >= 0)
+            {
+                int x = X(gdi->latMs);
+                MoveToEx(dc, x, pl.top, nullptr); LineTo(dc, x, pl.bottom);
+            }
+        }
+
+        DeleteObject(penLat);
+
+        swprintf(buf, 64, L"%.2f мс", avgLatMs_total);
+        SetTextColor(dc, RGB(0, 0, 0));
+        TextOutW(dc, X(avgLatMs_total) + 5, pl.top + 3, buf, (int)wcslen(buf));
+        TextOutW(dc, X(avgLatMs_total) + 3, pl.top + 1, buf, (int)wcslen(buf));
         SetTextColor(dc, RGB(230, 80, 80));
-        swprintf(buf, 64, L"%.2f мс", gd->latMs);
-        TextOutW(dc, x + 4, pl.top + 2, buf, (int)wcslen(buf));
-        DeleteObject(penLat); 
+        TextOutW(dc, X(avgLatMs_total) + 4, pl.top + 2, buf, (int)wcslen(buf));
+        
     }
 
     // --- Маркеры точек замера (raw) ---
+    if (!bShowAll)
     if (gd->raw_pts.size())
     {
         std::vector<POINT> poly;
@@ -445,47 +506,76 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         DeleteObject(penMarkBorder);
     }
     // --- Маркеры точек замера (сглаженные) ---
-    if (gd->pts.size())
+    if (!bShowAll)
     {
-        std::vector<POINT> poly;
-        poly.reserve(gd->pts.size());
-        for (const auto& p : gd->pts)
-            poly.push_back({ X(p.t), Y(p.deg) });
-
-       
-       HPEN penCurve = CreatePen(PS_SOLID, 1, RGB(80, 200, 120));
-        SelectObject(dc, penCurve);
-       if (poly.size() >= 2)
-            Polyline(dc, poly.data(), (int)poly.size());
-
-        DeleteObject(penCurve);
+        if (gd->pts.size())
+        {
+            std::vector<POINT> poly;
+            poly.reserve(gd->pts.size());
+            for (const auto& p : gd->pts)
+                poly.push_back({ X(p.t), Y(p.deg) });
 
 
+            HPEN penCurve = CreatePen(PS_SOLID, 1, RGB(80, 200, 120));
+            SelectObject(dc, penCurve);
+            if (poly.size() >= 2)
+                Polyline(dc, poly.data(), (int)poly.size());
+
+            DeleteObject(penCurve);
+
+
+            HBRUSH brMark = CreateSolidBrush(RGB(80, 200, 120));
+            HPEN   penMarkBorder = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
+            HGDIOBJ oldBr = SelectObject(dc, brMark);
+            HGDIOBJ oldPn = SelectObject(dc, penMarkBorder);
+
+            const int R = 3;              // радиус маркера в пикселях
+            const int MIN_PX_GAP = 4;     // прореживание: не ближе N px друг к другу
+
+            POINT last = { -10000, -10000 };
+            for (size_t i = 0; i < poly.size(); ++i) {
+                const POINT& pt = poly[i];
+                bool isEdge = (i == 0 || i == poly.size() - 1);
+                long dx = pt.x - last.x, dy = pt.y - last.y;
+                if (!isEdge && (dx * dx + dy * dy) < (MIN_PX_GAP * MIN_PX_GAP))
+                    continue;
+                Ellipse(dc, pt.x - R, pt.y - R, pt.x + R + 1, pt.y + R + 1);
+                last = pt;
+            }
+
+            SelectObject(dc, oldBr);
+            SelectObject(dc, oldPn);
+            DeleteObject(brMark);
+            DeleteObject(penMarkBorder);
+        }
+    }
+    else
+    {
         HBRUSH brMark = CreateSolidBrush(RGB(80, 200, 120));
-        HPEN   penMarkBorder = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
         HGDIOBJ oldBr = SelectObject(dc, brMark);
-        HGDIOBJ oldPn = SelectObject(dc, penMarkBorder);
 
-        const int R = 3;              // радиус маркера в пикселях
-        const int MIN_PX_GAP = 4;     // прореживание: не ближе N px друг к другу
+        HPEN penCurve = CreatePen(PS_SOLID, 1, RGB(80, 200, 120));
+        HGDIOBJ oldPn = SelectObject(dc, penCurve);
 
-        POINT last = { -10000, -10000 };
-        for (size_t i = 0; i < poly.size(); ++i) {
-            const POINT& pt = poly[i];
-            bool isEdge = (i == 0 || i == poly.size() - 1);
-            long dx = pt.x - last.x, dy = pt.y - last.y;
-            if (!isEdge && (dx * dx + dy * dy) < (MIN_PX_GAP * MIN_PX_GAP))
-                continue;
-            Ellipse(dc, pt.x - R, pt.y - R, pt.x + R + 1, pt.y + R + 1);
-            last = pt;
+        for (auto gdi : g_graphs)
+        {
+            if (gdi->pts.size())
+            {
+                std::vector<POINT> poly;
+                poly.reserve(gdi->pts.size());
+                for (const auto& p : gdi->pts)
+                    poly.push_back({ X(p.t), Y(p.deg) });
+
+                if (poly.size() >= 2)
+                    Polyline(dc, poly.data(), (int)poly.size());
+            }
         }
 
         SelectObject(dc, oldBr);
         SelectObject(dc, oldPn);
+        DeleteObject(penCurve);
         DeleteObject(brMark);
-        DeleteObject(penMarkBorder);
     }
-
 
     // Кривая ускорения
     {
@@ -495,9 +585,8 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
  
         float impulseEndValue = 0;
         float midValue = 0;
-        float valuePercent = 0;
+        float valueSpanStart = 0;
         float impulseMid = gd->latMs + (gd->pulseMs - gd->latMs) * 0.5;
-        float impulsePercent = gd->pulseMs - g_avgSpeedSpanMs*0.5;
         float impulseSpanStartMS = gd->pulseMs - g_avgSpeedSpanMs * 0.5;
         float impulseSpanEndMS = gd->pulseMs + g_avgSpeedSpanMs * 0.5;
         float impulsePercentRawMS = 0;
@@ -505,10 +594,9 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         for (const auto& p : gd->pts)
         {
             if (p.t <= impulseMid) midValue = p.deg;
-            if (p.t <= impulsePercent)
+            if (p.t <= impulseSpanStartMS)
             {
-                valuePercent = p.deg;
-                impulsePercentRawMS = p.t;
+                valueSpanStart = p.deg;
             }
 
             if (p.t <= gd->pulseMs) impulseEndValue = p.deg;
@@ -518,13 +606,14 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
                 break;
             }
         }
-        impulsePercent = impulsePercentRawMS;
+
+        if (bShowAll) impulseEndValue = avgDeg_total;
 
         int startX = X(gd->latMs);
         int endX = X(gd->pulseMs);
         int endY = Y(impulseEndValue);
-        int percX = X(impulsePercent);
-        int percY = Y(valuePercent);
+        int percX = X(impulseSpanStartMS);
+        int percY = Y(valueSpanStart);
         int midY = Y(midValue);
         int endSpanX = X(gd->pulseMs + g_avgSpeedSpanMs * 0.5);
 
@@ -535,23 +624,40 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
             TextOutW(dc, X(gd->pulseMs) + 10, midY - 15, buf, (int)wcslen(buf));
         }
 
-        SetTextColor(dc, RGB(255, 255, 255));
-        swprintf(buf, 64, L"%.0f об/м/с", gd->acc);
-        TextOutW(dc, X(impulseMid) + 5, Y(midValue) + 5, buf, (int)wcslen(buf));
-
+        if (!bShowAll)
         {
-            swprintf(buf, 64, L"%.0f об/м", gd->avgV);
+            SetTextColor(dc, RGB(255, 255, 255));
+            swprintf(buf, 64, L"%.0f об/м/с", gd->acc);
+            TextOutW(dc, X(impulseMid) + 5, Y(midValue) + 5, buf, (int)wcslen(buf));
 
-            SIZE sz;
-            GetTextExtentPoint32W(dc, buf, (int)wcslen(buf), &sz);
+            {
+                swprintf(buf, 64, L"%.0f об/м", gd->avgV);
 
-            TextOutW(dc, percX + (endSpanX - percX - sz.cx)*0.5, percY + 10, buf, (int)wcslen(buf));
+                SIZE sz;
+                GetTextExtentPoint32W(dc, buf, (int)wcslen(buf), &sz);
+
+                TextOutW(dc, percX + (endSpanX - percX - sz.cx) * 0.5, percY + 10, buf, (int)wcslen(buf));
+            }
         }
+        else
+        {
+            SetTextColor(dc, RGB(255, 255, 255));
+            swprintf(buf, 64, L"%.0f об/м/с", acc_avg_total);
+            TextOutW(dc, X(impulseMid) + 5, Y(midValue) + 5, buf, (int)wcslen(buf));
 
-       
+            {
+                swprintf(buf, 64, L"%.0f об/м", avgV_total);
+
+                SIZE sz;
+                GetTextExtentPoint32W(dc, buf, (int)wcslen(buf), &sz);
+
+                TextOutW(dc, percX + (endSpanX - percX - sz.cx) * 0.5, percY + 10, buf, (int)wcslen(buf));
+            }
+        }
+        
 
         {
-            int top = pl.bottom - 160;
+            int top = pl.bottom - 190;
 
             
             RECT bgr = { pl.right - 280, top - 10, pl.right + 1, pl.bottom + 1 };
@@ -562,39 +668,36 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
             HBRUSH brFr = CreateSolidBrush(RGB(48, 48, 56));
             FrameRect(dc, &bgr, brFr);
             DeleteObject(brFr);
-            
 
             SetTextColor(dc, RGB(255, 255, 255));
 
             swprintf(buf, 64, L"Измерений: %d", okCount);
             TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
 
-            swprintf(buf, 64, L"Ср. угол: %.2f\u00B0", gd->avgDeg_total);
+            swprintf(buf, 64, L"Ср. порог: %.3f\u00B0", avg_thrDeg_total);
             TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
 
-            swprintf(buf, 64, L"Ср. скорость: %.1f об/м", gd->avgV_total);
+            swprintf(buf, 64, L"Ср. угол: %.2f\u00B0", avgDeg_total);
             TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
 
-            swprintf(buf, 64, L"Ср. ускорение: %.0f об/м/с", gd->acc_avg_total);
+            swprintf(buf, 64, L"Ср. скорость: %.1f об/м", avgV_total);
             TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
 
+            swprintf(buf, 64, L"Ср. ускорение: %.0f об/м/с", acc_avg_total);
+            TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
 
-            swprintf(buf, 64, L"Ср. задержка: %.2f мс", gd->avgLatMs_total);
+            swprintf(buf, 64, L"Ср. задержка: %.2f мс", avgLatMs_total);
             TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
         }
-
-       
 
         DeleteObject(penLat);
 
 
         SetTextColor(dc, RGB(80, 200, 120));
 
-      
-        //swprintf(buf, 64, L"%.2f\u00B0", valuePercent);
-        //TextOutW(dc, percX - 65, percY - 15, buf, (int)wcslen(buf));
         SelectObject(dc, font);
 
+        // Границы замера ср. скорости
         {
             swprintf(buf, 64, L"%.1f мс", impulseSpanStartMS);
 
@@ -610,23 +713,25 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
             TextOutW(dc, endSpanX + 5, pl.top, buf, (int)wcslen(buf));
         }
 
-        swprintf(buf, 64, L"%.2f\u00B0", impulseEndValue);
-        TextOutW(dc, pl.right - 50 + 5, endY - 7, buf, (int)wcslen(buf));
+        // Значение в конце импульса
+        {
+            SelectObject(dc, font2);
+            swprintf(buf, 64, L"%.2f\u00B0", impulseEndValue);
+            TextOutW(dc, pl.right - 60 + 5, endY - 15, buf, (int)wcslen(buf));
+        }
 
         {
             HPEN penThr = CreatePen(PS_DOT, 1, RGB(80, 200, 120));
             SelectObject(dc, penThr);
 
-            MoveToEx(dc, percX, endY, nullptr); LineTo(dc, pl.right - 50, endY);
+            MoveToEx(dc, percX, endY, nullptr); LineTo(dc, pl.right - 60, endY);
             DeleteObject(penThr);
         }
         {
-            HPEN penThr = CreatePen(PS_SOLID, 1, RGB(80, 200, 120));
+            HPEN penThr = CreatePen(PS_DOT, 1, RGB(80, 200, 120));
             SelectObject(dc, penThr);
 
             MoveToEx(dc, percX, percY, nullptr); LineTo(dc, percX, pl.top);
-
-            
             MoveToEx(dc, endSpanX, percY, nullptr); LineTo(dc, endSpanX, pl.top);
 
             DeleteObject(penThr);
@@ -651,6 +756,7 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
     SelectObject(dc, old);
 
     // --- Перекрестие, примагниченное к ближайшей точке замера ---
+    if (!bShowAll)
     if (g_hasMouse && g_snapIdx >= 0 && g_snapIdx < (int)gd->raw_pts.size())
     {
         SelectObject(dc, font2);
@@ -779,7 +885,7 @@ static LRESULT CALLBACK GraphWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             (g_curGraph >= 0 && g_curGraph < (int)g_graphs.size())
             ? g_graphs[g_curGraph] : nullptr;
 
-        if (g_hasMouse)
+        if (g_hasMouse && gd)
         {
             RECT rc; GetClientRect(h, &rc);
             GraphGeom geom = ComputeGraphGeom(rc, gd);
@@ -818,18 +924,19 @@ static void SetCurGraph(int i)
 
     if (g_graphs.empty()) { g_curGraph = -1; }
     else {
-        if (i < 0) i = 0;
+        if (i < -1) i = -1;
         if (i >= (int)g_graphs.size()) i = (int)g_graphs.size() - 1;
         g_curGraph = i;
     }
-    wchar_t buf[96];
+    wchar_t buf[128];
     if (g_curGraph >= 0) {
         const GraphData* gd = g_graphs[g_curGraph];
-        swprintf(buf, 96, L"Импульс %d/%d  (сила %.0f%%, %.0f мс)",
+        swprintf(buf, 128, L"Импульс %d/%d  (сила %.0f%%, %.0f мс)",
             g_curGraph + 1, (int)g_graphs.size(), gd->forcePct, gd->pulseMs);
     }
     else {
-        wcscpy_s(buf, L"Нет графиков");
+        if (g_graphs.empty()) wcscpy_s(buf, L"Нет графиков");
+        else swprintf(buf, 128, L"Измерений: %d/%d  (сила %.0f%%, %.0f мс)", (int)g_graphs.size(), g_Repeats, g_graphs[0]->forcePct, g_graphs[0]->pulseMs);
     }
     SetWindowTextW(g_hGraphLbl, buf);
     InvalidateRect(g_hGraph, nullptr, FALSE);
@@ -1032,6 +1139,8 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
     timeBeginPeriod(1);
 
     g_wheelPolarity = 0;
+
+    g_Repeats = P.repeats;
 
     IDirectInputDevice8* dev = nullptr;
     IDirectInputEffect*  eff = nullptr;
@@ -1274,17 +1383,19 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
                 double mAav = sumAccAv / okCount, mVel = sumVel / okCount;
                 double mLat = sumLat / okCount;
                 double mAngle = sumAngle / okCount;
+                double mThrDeg = sumThrDeg / okCount;
 
                 GraphData* gd = new GraphData;
                 gd->noise = noise / unitsPerDeg;// град
                 gd->acc = aavgRPMs;// об/мин/с
-                gd->acc_avg_total = mAav / 6.0;// об/мин/с
+                acc_avg_total = mAav / 6.0;// об/мин/с
                 gd->avgV = avgV * 1000.0 / unitsPerDeg / 6.0;// об/мин
-                gd->avgV_total = mVel / 6.0;// об/мин
-                gd->avgDeg_total = mAngle;// град
+                avgV_total = mVel / 6.0;// об/мин
+                avgDeg_total = mAngle;// град
+                avg_thrDeg_total = mThrDeg;//град
                 gd->pulseMs = (float)P.pulseMs;
                 gd->latMs = (float)lat;
-                gd->avgLatMs_total = mLat;
+                avgLatMs_total = mLat;
                 
 
                 gd->thrDeg = (float)(thr / unitsPerDeg);      // твой коэффициент raw -> градусы
@@ -1397,7 +1508,7 @@ static void StartMeasurement() {
     P->devGuid     = g_devices[sel].guid;
     P->pulseMs     = max(1,  GetEditInt(g_hMain, IDC_EDIT_PULSE, 20));
     P->forcePct    = max(1,  min(100, GetEditInt(g_hMain, IDC_EDIT_FORCE, 30)));
-    P->repeats     = max(1,  GetEditInt(g_hMain, IDC_EDIT_REPEATS, 10));
+    P->repeats     = max(1,  GetEditInt(g_hMain, IDC_EDIT_REPEATS, g_Repeats));
     P->pauseMs = 500;// max(100, GetEditInt(g_hMain, IDC_EDIT_PAUSE, 1500));
     P->wheelDeg    = max(90, GetEditInt(g_hMain, IDC_EDIT_WHEELDEG, 900));
     P->threshDeg = max(0.01,  GetEditFloat(g_hMain, IDC_EDIT_THRESH));
@@ -1515,7 +1626,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         int baseY = 130;
         float g_part = 0.55;
 
-        MoveWindow(g_hGraphLbl, PAD, baseY, 260, 20, TRUE);
+        MoveWindow(g_hGraphLbl, PAD, baseY, 360, 20, TRUE);
         MoveWindow(g_hGraph, PAD, baseY + 25, w* g_part - PAD, h - 25 - 30 - baseY, TRUE);
 
         MoveWindow(g_hOut, w * g_part + PAD, baseY + 25, w * (1.0 - g_part) - PAD * 2, h - 25 - 30 - baseY, TRUE);
@@ -1543,13 +1654,12 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wp, LPARAM lp) {
         gd->ltDeg = (float)ComputeLinThreshold(gd);
         g_graphs.push_back(gd);
 
-        for (auto& g : g_graphs)
-        {
-            g->acc_avg_total = gd->acc_avg_total;
-            g->avgV_total = gd->avgV_total;
-        }
         // автопереход на только что добавленный график
-        SetCurGraph((int)g_graphs.size() - 1);
+        /*if (g_curGraph == g_graphs.size() - 2)
+            SetCurGraph((int)g_graphs.size() - 1);
+        else*/
+        SetCurGraph(g_curGraph);
+
         return 0;
     }
 
@@ -1658,7 +1768,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     RegisterClassW(&wc);
     
     HWND hWnd = CreateWindowW(L"FFBMeterWnd",
-        L"FFB Meter - 0.2.1",
+        L"FFB Meter - 0.2.2",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1500, 900,
         nullptr, nullptr, hInst, nullptr);
