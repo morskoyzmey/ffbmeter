@@ -146,6 +146,7 @@ float avgDeg_total;// средний угол в конце импульса
 float acc_avg_total;// среднее ускорение за все измерения
 float avgV_total;// средняя скорость за все измерения
 float avgLatMs_total;// средняя задержка за все измерения
+float avgCallMs_total;// среднее время вызова за все измерения
 float avg_thrDeg_total;// средний порог срабатывания
 
 struct GraphData {
@@ -153,6 +154,7 @@ struct GraphData {
     std::vector<GraphPt> raw_pts;
     float pulseMs;   // длительность импульса
     float latMs;     // измеренная задержка, -1 если не определена
+    float callMs;     // измеренное время вызова
     float thrDeg;    // порог срабатывания, градусы
     float ltDeg;     // <-- порог линейной зоны symlog, считается один раз при добавлении
     int   idx;       // номер импульса (1..N)
@@ -445,6 +447,10 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
             SetTextColor(dc, RGB(230, 80, 80));
             TextOutW(dc, x + 4, pl.top + 2, buf, (int)wcslen(buf));
         }
+
+        SetTextColor(dc, RGB(240, 230, 0));
+        swprintf(buf, 64, L"%.2f мс", gd->callMs);
+        TextOutW(dc, pl.left + 5, pl.top + 2, buf, (int)wcslen(buf));
     }
     else
     {
@@ -469,6 +475,11 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         TextOutW(dc, X(avgLatMs_total) + 3, pl.top + 1, buf, (int)wcslen(buf));
         SetTextColor(dc, RGB(230, 80, 80));
         TextOutW(dc, X(avgLatMs_total) + 4, pl.top + 2, buf, (int)wcslen(buf));
+
+
+        SetTextColor(dc, RGB(240, 230, 0));
+        swprintf(buf, 64, L"%.2f мс", avgCallMs_total);
+        TextOutW(dc, pl.left + 5, pl.top + 2, buf, (int)wcslen(buf));
         
     }
 
@@ -657,7 +668,7 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
         
 
         {
-            int top = pl.bottom - 190;
+            int top = pl.bottom - 210;
 
             
             RECT bgr = { pl.right - 280, top - 10, pl.right + 1, pl.bottom + 1 };
@@ -687,6 +698,9 @@ static void DrawGraph(HDC dc, const RECT& rc, const GraphData* gd)
             TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
 
             swprintf(buf, 64, L"Ср. задержка: %.2f мс", avgLatMs_total);
+            TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
+
+            swprintf(buf, 64, L"Ср. вызов: %.2f мс", avgCallMs_total);
             TextOutW(dc, pl.right - 260, top, buf, (int)wcslen(buf)); top += 30;
         }
 
@@ -1022,7 +1036,7 @@ static int DetectPolarity(IDirectInputDevice8* dev, IDirectInputEffect* eff,
     DIEFFECT& ef, DICONSTANTFORCE& cf,
     double unitsPerDeg, double qpcToMs)
 {
-    const LONG   probeForces[] = { 200, 350, 500 }; // возрастающая амплитуда
+    const LONG   probeForces[] = { 150, 300, 500 }; // возрастающая амплитуда
     const double probeMs = 120.0;             // длительность импульса
     const double minMoveDeg = 0.5;               // порог надёжного обнаружения
 
@@ -1090,8 +1104,8 @@ static void CenterWheel(IDirectInputDevice8* dev, IDirectInputEffect* eff,
         g_wheelPolarity = DetectPolarity(dev, eff, ef, cf, unitsPerDeg, qpcToMs);
     const int polarity = g_wheelPolarity;
 
-    const double Kp   = 100.0;   // ед. силы на градус ошибки
-    const double Kd   = 10.0;    // ед. силы на град/с — демпфирование
+    const double Kp   = 50.0;   // ед. силы на градус ошибки
+    const double Kd   = 2.0;    // ед. силы на град/с — демпфирование
     const LONG   Fmax = 1000;    // лимит силы 10% — безопасно для DD
 
     LARGE_INTEGER t0, tc; QueryPerformanceCounter(&t0);
@@ -1201,19 +1215,19 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
 
         // --- заголовки: читаемые в окно + TSV в буфер копирования ----------
         PostText(hN, WM_APP_ADDROW,
-            L"  №  ±   Задерж   Порог   Ср.ускор   Ср.ускор    Ср.скор    Угол");
+            L"  №  ±   Вызов  Задерж   Порог  Ср.уск.  Ср.уск.    Ср.скор    Угол");
         PostText(hN, WM_APP_ADDROW,
-            L"             мс    град    град/с²     об/м/с     об/мин    град");
+            L"            мс      мс    град  град/с²   об/м/с     об/мин    град");
         PostText(hN, WM_APP_ADDROW,
-            L"--- --- -------  ------  ---------  ---------  ---------  ------");
+            L"--- --- ------  ------  ------  -------  -------  ---------  ------");
         PostText(hN, WM_APP_ADDTSV,
-            L"№\tНапр\tЗадержка,мс\tПорог,град\t"
+            L"№\tНапр\tВызов,мс\tЗадержка,мс\tПорог,град\t"
             L"Ср.ускор,град/с²\tСр.ускор,об/мин/с\t"
             L"Ср.скор,об/мин\t"
             L"Угол,град");
 
         std::vector<Sample> smp; smp.reserve(8192);
-        double sumLat = 0, sumAngle = 0, sumAccAv = 0, sumVel = 0, sumThrDeg = 0;
+        double sumLat = 0, sumCall = 0, sumAngle = 0, sumAccAv = 0, sumVel = 0, sumThrDeg = 0;
         okCount = 0;
 
         PostMessage(hN, WM_APP_CLEARGRAPH, 0, 0);
@@ -1269,6 +1283,7 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
                 SetStatus(hN, L"Ошибка: Start эффекта"); break;
             }
 
+            const double callMs = (ta.QuadPart - tb.QuadPart) * qpcToMs;
             const double recMs = P.pulseMs + tailMs;
             double lastT = -1.0;
             for (;;) {
@@ -1361,17 +1376,18 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
             wchar_t row[320], tsv[320];
             const wchar_t* dirS = sign > 0 ? L"+" : L"-";
             if (lat < 0) {
-                swprintf(row, 320, L"%3d %2ls  %7ls %6ls %9ls  %9ls  %9ls   %8ls   %4ls",
-                         i, dirS, L"нет движ", L"-", L"-", L"-", L"-", L"-", L"-");
+                swprintf(row, 320, L"%3d %2ls  %6ls  %6ls %6ls %9ls  %7ls  %7ls   %8ls   %4ls",
+                         i, dirS, L"нет движ", L"-", L"-", L"-", L"-", L"-", L"-", L"-");
                 swprintf(tsv, 320, L"%d\t%ls\tнет движ.\t-\t-\t-\t-\t-\t-",
                          i, dirS);
             } else {
-                swprintf(row, 320, L"%3d %2ls  %7.2f  %6.3f  %9.0f  %9.0f   %8.1f   %5.2f",
-                         i, dirS, lat, thr / unitsPerDeg, aavgDegS, aavgRPMs,velRPM, lastDeg);
-                swprintf(tsv, 320, L"%d\t%ls\t%.2f\t%.3f\t%.0f\t%.0f\t%.1f\t%.2f",
-                         i, dirS, lat, thr / unitsPerDeg,  aavgDegS, aavgRPMs, velRPM, lastDeg);
+                swprintf(row, 320, L"%3d %2ls  %6.2f  %6.2f  %6.3f  %7.0f  %7.0f   %8.1f   %5.2f",
+                         i, dirS, callMs, lat, thr / unitsPerDeg, aavgDegS, aavgRPMs,velRPM, lastDeg);
+                swprintf(tsv, 320, L"%d\t%ls\t%.2f\t%.2f\t%.3f\t%.0f\t%.0f\t%.1f\t%.2f",
+                         i, dirS, callMs, lat, thr / unitsPerDeg,  aavgDegS, aavgRPMs, velRPM, lastDeg);
                 sumAngle += lastDeg;
                 sumLat += lat; sumAccAv += aavgDegS;
+                sumCall += callMs;
                 sumVel += velDegS;
                 sumThrDeg += thr / unitsPerDeg;
                 ++okCount;
@@ -1382,6 +1398,7 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
             {
                 double mAav = sumAccAv / okCount, mVel = sumVel / okCount;
                 double mLat = sumLat / okCount;
+                double mCall = sumCall / okCount;
                 double mAngle = sumAngle / okCount;
                 double mThrDeg = sumThrDeg / okCount;
 
@@ -1395,8 +1412,10 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
                 avg_thrDeg_total = mThrDeg;//град
                 gd->pulseMs = (float)P.pulseMs;
                 gd->latMs = (float)lat;
+                gd->callMs = (float)callMs;
                 avgLatMs_total = mLat;
                 
+                avgCallMs_total = mCall;
 
                 gd->thrDeg = (float)(thr / unitsPerDeg);      // твой коэффициент raw -> градусы
                 gd->idx = i + 1;
@@ -1418,16 +1437,17 @@ static DWORD WINAPI MeasureThread(LPVOID pv) {
         // --- строка средних значений --------------------------------------
         if (okCount > 0) {
             double mLat = sumLat / okCount;
+            double mCall = sumCall / okCount;
             double mAav = sumAccAv / okCount, mVel = sumVel / okCount;
             double mAngle = sumAngle / okCount;
             double mThrDeg = sumThrDeg / okCount;
             wchar_t row[320], tsv[320];
             PostText(hN, WM_APP_ADDROW,
-                L"--- --- -------  ------  ---------  ---------  ---------  ------");
-            swprintf(row, 320, L"%3ls %3ls %7.2f  %6.3f  %9.0f  %9.0f   %8.1f   %5.2f",
-                     L"Ср.", L"", mLat, mThrDeg, mAav, mAav / 6.0, mVel / 6.0, mAngle);
-            swprintf(tsv, 320, L"Среднее\t\t%.2f\t%.3f\t%.0f\t%.0f\t%.1f\t%.2f",
-                     mLat, mThrDeg, mAav, mAav / 6.0, mVel / 6.0, mAngle);
+                L"--- --- ------  ------  ------  -------  -------  ---------  ------");
+            swprintf(row, 320, L"%3ls %3ls %6.2f  %6.2f  %6.3f  %7.0f  %7.0f   %8.1f   %5.2f",
+                     L"Ср.", L"", mCall, mLat, mThrDeg, mAav, mAav / 6.0, mVel / 6.0, mAngle);
+            swprintf(tsv, 320, L"Среднее\t\t%.2f\t%.2f\t%.3f\t%.0f\t%.0f\t%.1f\t%.2f",
+                mCall, mLat, mThrDeg, mAav, mAav / 6.0, mVel / 6.0, mAngle);
             PostText(hN, WM_APP_ADDROW, row);
             PostText(hN, WM_APP_ADDTSV, tsv);
         }
@@ -1768,7 +1788,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nShow) {
     RegisterClassW(&wc);
     
     HWND hWnd = CreateWindowW(L"FFBMeterWnd",
-        L"FFB Meter - 0.2.2",
+        L"FFB Meter - 0.2.3",
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT, 1500, 900,
         nullptr, nullptr, hInst, nullptr);
